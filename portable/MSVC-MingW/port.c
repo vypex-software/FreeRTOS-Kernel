@@ -66,8 +66,8 @@ static void prvProcessSimulatedInterrupts( void );
  * Interrupt handlers used by the kernel itself.  These are executed from the
  * simulated interrupt handler thread.
  */
-static uint32_t prvProcessYieldInterrupt( void );
-static uint32_t prvProcessTickInterrupt( void );
+static void prvProcessYieldInterrupt( void );
+static void prvProcessTickInterrupt( void );
 
 /*
  * Exiting a critical section will cause the calling task to block on yield
@@ -127,13 +127,15 @@ static volatile uint32_t ulCriticalNesting = 9999UL;
 /* Handlers for all the simulated software interrupts.  The first two positions
  * are used for the Yield and Tick interrupts so are handled slightly differently,
  * all the other interrupts can be user defined. */
-static uint32_t (* ulIsrHandler[ portMAX_INTERRUPTS ])( void ) = { 0 };
+static void (* ulIsrHandler[ portMAX_INTERRUPTS ])( void ) = { 0 };
 
 /* Pointer to the TCB of the currently executing task. */
 extern void * volatile pxCurrentTCB;
 
 /* Used to ensure nothing is processed during the startup sequence. */
 static BaseType_t xPortRunning = pdFALSE;
+
+static DWORD dwIsrYieldTlsIndex;
 
 /*-----------------------------------------------------------*/
 
@@ -289,6 +291,12 @@ BaseType_t xPortStartScheduler( void )
             printf( "SetPriorityClass() failed\r\n" );
         }
 
+        if ( ( dwIsrYieldTlsIndex = TlsAlloc() ) == TLS_OUT_OF_INDEXES )
+        {
+            printf( "TlsAlloc dwIsrYieldTlsIndex failed\r\n" );
+            lSuccess = pdFAIL;
+        }
+
         /* Install the interrupt handlers used by the scheduler itself. */
         vPortSetInterruptHandler( portINTERRUPT_YIELD, prvProcessYieldInterrupt );
         vPortSetInterruptHandler( portINTERRUPT_TICK, prvProcessTickInterrupt );
@@ -363,14 +371,14 @@ BaseType_t xPortStartScheduler( void )
 }
 /*-----------------------------------------------------------*/
 
-static uint32_t prvProcessYieldInterrupt( void )
+static void prvProcessYieldInterrupt( void )
 {
     /* Always return true as this is a yield. */
-    return pdTRUE;
+    vPortYieldFromIsr( pdTRUE );
 }
 /*-----------------------------------------------------------*/
 
-static uint32_t prvProcessTickInterrupt( void )
+static void prvProcessTickInterrupt( void )
 {
     uint32_t ulSwitchRequired;
 
@@ -378,7 +386,7 @@ static uint32_t prvProcessTickInterrupt( void )
     configASSERT( xPortRunning );
     ulSwitchRequired = ( uint32_t ) xTaskIncrementTick();
 
-    return ulSwitchRequired;
+    vPortYieldFromIsr( ulSwitchRequired );
 }
 /*-----------------------------------------------------------*/
 
@@ -435,7 +443,11 @@ static void prvProcessSimulatedInterrupts( void )
                     {
                         /* Run the actual handler.  Handlers return pdTRUE if they
                          * necessitate a context switch. */
-                        if( ulIsrHandler[ i ]() != pdFALSE )
+                    	ulIsrHandler[ i ]();
+
+                    	BaseType_t xYieldResult = ( BaseType_t ) TlsGetValue( dwIsrYieldTlsIndex );
+
+                        if( xYieldResult != pdFALSE )
                         {
                             /* A bit mask is used purely to help debugging. */
                             ulSwitchRequired |= ( 1 << i );
@@ -583,6 +595,7 @@ void vPortCloseRunningThread( void * pvTaskToDelete,
 void vPortEndScheduler( void )
 {
     xPortRunning = pdFALSE;
+    TlsFree(dwIsrYieldTlsIndex);
 }
 /*-----------------------------------------------------------*/
 
@@ -653,7 +666,7 @@ void vPortGenerateSimulatedInterruptFromWindowsThread( uint32_t ulInterruptNumbe
 /*-----------------------------------------------------------*/
 
 void vPortSetInterruptHandler( uint32_t ulInterruptNumber,
-                               uint32_t ( * pvHandler )( void ) )
+                               void ( * pvHandler )( void ) )
 {
     if( ulInterruptNumber < portMAX_INTERRUPTS )
     {
@@ -668,6 +681,12 @@ void vPortSetInterruptHandler( uint32_t ulInterruptNumber,
             ulIsrHandler[ ulInterruptNumber ] = pvHandler;
         }
     }
+}
+/*-----------------------------------------------------------*/
+
+void vPortYieldFromIsr( BaseType_t xHigherPriorityTaskWoken )
+{
+	TlsSetValue( dwIsrYieldTlsIndex, ( LPVOID )xHigherPriorityTaskWoken );
 }
 /*-----------------------------------------------------------*/
 

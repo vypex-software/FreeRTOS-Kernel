@@ -109,10 +109,9 @@ typedef portSTACK_TYPE           StackType_t;
 extern volatile BaseType_t xInsideInterrupt;
 #define portSOFTWARE_BARRIER()    while( xInsideInterrupt != pdFALSE )
 
-
 /* Simulated interrupts return pdFALSE if no context switch should be performed,
  * or a non-zero number if a context switch should be performed. */
-#define portYIELD_FROM_ISR( x )       return x
+#define portYIELD_FROM_ISR( x )       vPortYieldFromIsr( x )
 #define portEND_SWITCHING_ISR( x )    portYIELD_FROM_ISR( ( x ) )
 
 void vPortCloseRunningThread( void * pvTaskToDelete,
@@ -217,7 +216,9 @@ void vPortGenerateSimulatedInterruptFromWindowsThread( uint32_t ulInterruptNumbe
  * handler resulted in a task switch being required.
  */
 void vPortSetInterruptHandler( uint32_t ulInterruptNumber,
-                               uint32_t ( * pvHandler )( void ) );
+                               void ( * pvHandler )( void ) );
+
+void vPortYieldFromIsr( BaseType_t xHigherPriorityTaskWoken );
 
 #ifdef __cplusplus
 }
