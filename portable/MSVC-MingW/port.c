@@ -431,6 +431,20 @@ static void prvProcessSimulatedInterrupts( void )
              * necessitated a context switch to another task/thread. */
             ulSwitchRequired = pdFALSE;
 
+            /* Suspend the old thread. */
+            pxThreadState = ( ThreadState_t * ) *( ( size_t * ) pxCurrentTCB );
+            SuspendThread( pxThreadState->pvThread );
+
+            /* Ensure the thread is actually suspended by performing a
+             * synchronous operation that can only complete when the thread
+             * is actually suspended. The below code asks for dummy register
+             * data. Experimentation shows that these two lines don't appear
+             * to do anything now, but according to
+             * https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743
+             * they do - so as they do not harm (slight run-time hit). */
+            xContext.ContextFlags = CONTEXT_INTEGER;
+            ( void ) GetThreadContext( pxThreadState->pvThread, &xContext );
+
             /* For each interrupt we are interested in processing, each of which is
              * represented by a bit in the 32bit ulPendingInterrupts variable. */
             for( i = 0; i < portMAX_INTERRUPTS; i++ )
@@ -461,32 +475,19 @@ static void prvProcessSimulatedInterrupts( void )
 
             if( ulSwitchRequired != pdFALSE )
             {
-                /* Suspend the old thread. */
-                pxThreadState = ( ThreadState_t * ) *( ( size_t * ) pxCurrentTCB );
-                SuspendThread( pxThreadState->pvThread );
-
-                /* Ensure the thread is actually suspended by performing a
-                 * synchronous operation that can only complete when the thread
-                 * is actually suspended. The below code asks for dummy register
-                 * data. Experimentation shows that these two lines don't appear
-                 * to do anything now, but according to
-                 * https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743
-                 * they do - so as they do not harm (slight run-time hit). */
-                xContext.ContextFlags = CONTEXT_INTEGER;
-                ( void ) GetThreadContext( pxThreadState->pvThread, &xContext );
-
                 /* Select the next task to run. */
                 vTaskSwitchContext();
-
-                /* Obtain the state of the task now selected to enter the
-                 * Running state. */
-                pxThreadState = ( ThreadState_t * ) ( *( size_t * ) pxCurrentTCB );
-
-                /* pxThreadState->pvThread can be NULL if the task deleted
-                 * itself - but a deleted task should never be resumed here. */
-                configASSERT( pxThreadState->pvThread != NULL );
-                ResumeThread( pxThreadState->pvThread );
             }
+
+            /* Obtain the state of the task now selected to enter the
+             * Running state. */
+            pxThreadState = ( ThreadState_t * ) ( *( size_t * ) pxCurrentTCB );
+
+            /* pxThreadState->pvThread can be NULL if the task deleted
+             * itself - but a deleted task should never be resumed here. */
+            configASSERT( pxThreadState->pvThread != NULL );
+            ResumeThread( pxThreadState->pvThread );
+
 
             /* If the thread that is about to be resumed stopped running
              * because it yielded then it will wait on an event when it resumed
