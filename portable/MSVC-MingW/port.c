@@ -32,6 +32,7 @@
 /* Scheduler includes. */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "timers.h"
 
 #ifdef __GNUC__
     #include "mmsystem.h"
@@ -212,6 +213,8 @@ static BOOL WINAPI prvEndProcess( DWORD dwCtrlType )
          * the process started with a timeEndPeriod() as the process exits. */
         timeEndPeriod( xTimeCaps.wPeriodMin );
     }
+
+    TlsFree(dwIsrYieldTlsIndex);
 
     return pdFALSE;
 }
@@ -418,7 +421,7 @@ static void prvProcessSimulatedInterrupts( void )
          * the scheduler is stopped by calling vPortEndScheduler. */
         xWinApiResult = WaitForMultipleObjects( sizeof( pvObjectList ) / sizeof( void * ), pvObjectList, TRUE, xTimeoutMilliseconds );
 
-        if( xWinApiResult != WAIT_TIMEOUT )
+        if( xWinApiResult != WAIT_TIMEOUT && xPortRunning == pdTRUE )
         {
             /* Cannot be in a critical section to get here.  Tasks that exit a
              * critical section will block on a yield mutex to wait for an interrupt to
@@ -487,7 +490,6 @@ static void prvProcessSimulatedInterrupts( void )
              * itself - but a deleted task should never be resumed here. */
             configASSERT( pxThreadState->pvThread != NULL );
             ResumeThread( pxThreadState->pvThread );
-
 
             /* If the thread that is about to be resumed stopped running
              * because it yielded then it will wait on an event when it resumed
@@ -595,8 +597,71 @@ void vPortCloseRunningThread( void * pvTaskToDelete,
 
 void vPortEndScheduler( void )
 {
+    TaskHandle_t *pxTaskHandles;
+    UBaseType_t uxTaskCount;
+    UBaseType_t x;
+    
+    /* Enter a task-aware critical section that will block all interrupts */
+    vPortEnterCritical();
+
+    vTaskSuspendAll();
+    
+    /* Get information about all running tasks */
+    uxTaskCount = uxTaskGetNumberOfTasks();
+    pxTaskHandles = pvPortMalloc(uxTaskCount * sizeof(TaskHandle_t));
+    
+    if (pxTaskHandles != NULL)
+    {
+        /* Get all task handles */
+        TaskStatus_t *pxTaskStatusArray = pvPortMalloc(uxTaskCount * sizeof(TaskStatus_t));
+        
+        if (pxTaskStatusArray != NULL)
+        {
+            /* Populate the status array */
+            uxTaskCount = uxTaskGetSystemState(pxTaskStatusArray, uxTaskCount, NULL);
+            
+            /* Extract handles into our array */
+            for (x = 0; x < uxTaskCount; x++)
+            {
+                pxTaskHandles[x] = pxTaskStatusArray[x].xHandle;
+            }
+            
+            vPortFree(pxTaskStatusArray);
+            
+            /* Delete all tasks except idle and timer tasks */
+            for (x = 0; x < uxTaskCount; x++)
+            {
+                TaskHandle_t xTask = pxTaskHandles[x];
+                
+                /* Skip idle and timer tasks */
+                if ((xTask != xTaskGetIdleTaskHandle()) && 
+                    (xTask != xTimerGetTimerDaemonTaskHandle()))
+                {
+                    vTaskDelete(xTask);
+                }
+            }
+        }
+        
+        vPortFree(pxTaskHandles);
+    }
+
+    xTaskResumeAll();
+
+    while(uxTaskGetNumberOfTasks() > 0)
+    {
+        /* Wait for all tasks to be deleted */
+        Sleep(100);
+    }
+    
+    vPortExitCritical();
+    
     xPortRunning = pdFALSE;
-    TlsFree(dwIsrYieldTlsIndex);
+
+    /* Signal the interrupt thread to exit */
+    if (pvInterruptEvent != NULL)
+    {
+        SetEvent(pvInterruptEvent);
+    }
 }
 /*-----------------------------------------------------------*/
 
@@ -647,6 +712,14 @@ void vPortGenerateSimulatedInterruptFromWindowsThread( uint32_t ulInterruptNumbe
         /* Can't proceed if in a critical section as pvInterruptEventMutex won't
          * be available. */
         WaitForSingleObject( pvInterruptEventMutex, INFINITE );
+
+        /* The scheduler may have been stopped while we were waiting for 
+         * pvInterruptEventMutex to become available. */
+        if( xPortRunning == pdFALSE )
+        {
+            ReleaseMutex( pvInterruptEventMutex );
+            return;
+        }
 
         /* Pending a user defined interrupt to be handled in simulated interrupt
          * handler thread. */
