@@ -458,7 +458,7 @@ static void * prvTimerTickHandler( void * arg )
          */
         Thread_t * thread = prvGetThreadFromTask( xTaskGetCurrentTaskHandle() );
         pthread_kill( thread->pthread, SIGALRM );
-        usleep( portTICK_RATE_MICROSECONDS );
+        usleep( portTICK_RATE_MICROSECONDS / 4 );
     }
 
     return NULL;
