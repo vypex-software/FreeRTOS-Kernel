@@ -69,6 +69,7 @@
 #include <sys/times.h>
 #include <time.h>
 #include <unistd.h>
+#include <semaphore.h>
 
 /* Scheduler includes. */
 #include "FreeRTOS.h"
@@ -112,6 +113,8 @@ static pthread_t hTimerTickThread;
 static bool xTimerTickThreadShouldRun;
 static uint64_t prvStartTimeNs;
 static pthread_key_t xThreadKey = 0;
+static timer_t xPosixTimer;
+static sem_t xTimerSemaphore;
 /*-----------------------------------------------------------*/
 
 static void prvSetupSignalsAndSchedulerPolicy( void );
@@ -327,7 +330,16 @@ void vPortEndScheduler( void )
 
     /* Stop the timer tick thread. */
     xTimerTickThreadShouldRun = false;
+    
+    /* Delete the POSIX timer */
+    timer_delete( xPosixTimer );
+    
+    /* Signal the timer thread to wake up and exit */
+    sem_post( &xTimerSemaphore );
     pthread_join( hTimerTickThread, NULL );
+    
+    /* Cleanup semaphore */
+    sem_destroy( &xTimerSemaphore );
 
     /* Signal the scheduler to exit its loop. */
     xSchedulerEnd = pdTRUE;
@@ -442,28 +454,40 @@ static uint64_t prvGetTimeNs( void )
  * to adjust timing according to full demo requirements */
 /* static uint64_t prvTickCount; */
 
+static void prvTimerCallback( union sigval sv )
+{
+    ( void ) sv;
+    /* Signal the timer thread that a tick occurred */
+    sem_post( &xTimerSemaphore );
+}
+
 static void * prvTimerTickHandler( void * arg )
 {
     ( void ) arg;
 
     prvMarkAsFreeRTOSThread();
-
     prvPortSetCurrentThreadName( "Scheduler timer" );
 
     while( xTimerTickThreadShouldRun )
     {
+        /* Wait for timer signal */
+        sem_wait( &xTimerSemaphore );
+        
+        if( !xTimerTickThreadShouldRun )
+        {
+            break;
+        }
+
         /*
          * signal to the active task to cause tick handling or
          * preemption (if enabled)
          */
         Thread_t * thread = prvGetThreadFromTask( xTaskGetCurrentTaskHandle() );
         pthread_kill( thread->pthread, SIGALRM );
-        usleep( portTICK_RATE_MICROSECONDS );
     }
 
     return NULL;
 }
-/*-----------------------------------------------------------*/
 
 /*
  * Setup the systick timer to generate the tick interrupts at the required
@@ -471,8 +495,41 @@ static void * prvTimerTickHandler( void * arg )
  */
 void prvSetupTimerInterrupt( void )
 {
+    struct sigevent sev;
+    struct itimerspec its;
+    int iRet;
+
+    /* Initialize semaphore for timer synchronization */
+    sem_init( &xTimerSemaphore, 0, 0 );
+
+    /* Start the timer thread */
     xTimerTickThreadShouldRun = true;
     pthread_create( &hTimerTickThread, NULL, prvTimerTickHandler, NULL );
+
+    /* Create the timer with thread callback (no signals) */
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = prvTimerCallback;
+    sev.sigev_notify_attributes = NULL;
+    sev.sigev_value.sival_ptr = NULL;
+
+    iRet = timer_create( CLOCK_MONOTONIC, &sev, &xPosixTimer );
+    if( iRet == -1 )
+    {
+        prvFatalError( "timer_create", errno );
+    }
+
+    /* Configure timer period */
+    its.it_value.tv_sec = 0;
+    its.it_value.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL);
+    its.it_interval.tv_sec = 0;
+    its.it_interval.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL);
+
+    /* Start the timer */
+    iRet = timer_settime( xPosixTimer, 0, &its, NULL );
+    if( iRet == -1 )
+    {
+        prvFatalError( "timer_settime", errno );
+    }
 
     prvStartTimeNs = prvGetTimeNs();
 }
