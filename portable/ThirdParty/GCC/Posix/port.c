@@ -115,6 +115,92 @@ static uint64_t prvStartTimeNs;
 static pthread_key_t xThreadKey = 0;
 static timer_t xPosixTimer;
 static sem_t xTimerSemaphore;
+
+/*
+ * Vypex integration-test port modifications (this is the vypex-software fork of
+ * the FreeRTOS POSIX port). Two changes live here, previously applied as a
+ * configure-time string patch from integration-tests/CMakeLists.txt:
+ *
+ * 1. Cross-thread kernel lock (xRppKernelLock). The upstream port's critical
+ *    section and interrupt-mask primitives only mask signals on the *calling*
+ *    thread, which gives no mutual exclusion against other host threads. The
+ *    fakes simulate ISRs by calling xTaskNotifyFromISR() from rpp new_thread
+ *    workers, so those calls race the scheduler's list manipulation. The window
+ *    is normally tiny, but tickless idle keeps the idle thread in
+ *    xTaskResumeAll() far longer, turning the latent race into a reliable
+ *    SIGSEGV. A shared recursive mutex serialises "ISR" code and the scheduler,
+ *    mirroring the model the MSVC-MingW simulator port uses: one global mutex
+ *    held during critical sections and fake-ISR code, released around the point
+ *    a thread blocks (so the resumed thread / a pending ISR can run) and
+ *    reacquired on wake. xRppLockDepth is per-thread (__thread) so the
+ *    release/reacquire count is correct regardless of the global
+ *    uxCriticalNesting (which is shared across host threads).
+ *
+ * 2. Tick speed-up (TESTS_BOOST_FACTOR). Dividing the tick interval by N makes
+ *    FreeRTOS advance N ticks per real ms, so e.g. a 20 s vTaskDelay finishes in
+ *    4 s wall clock at N=5. Composes with tickless idle.
+ */
+#ifndef TESTS_BOOST_FACTOR
+    #define TESTS_BOOST_FACTOR    1
+#endif
+
+static pthread_mutex_t xRppKernelLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static __thread int xRppLockDepth = 0;
+
+/* Saved signal mask + nesting depth for the fake-ISR interrupt-mask region
+ * (xPortSetInterruptMask / vPortClearInterruptMask). Per-thread; depth-tracked
+ * so nested FromISR masks restore the prior mask exactly once. */
+static __thread sigset_t xIsrSavedSignalMask;
+static __thread int xIsrMaskDepth = 0;
+
+static void prvRppLock( void )
+{
+    pthread_mutex_lock( &xRppKernelLock );
+    xRppLockDepth++;
+}
+
+static void prvRppUnlock( void )
+{
+    xRppLockDepth--;
+    pthread_mutex_unlock( &xRppKernelLock );
+}
+
+/*
+ * Release every level of xRppKernelLock this thread currently holds. Used both
+ * on the cooperative dying path (prvSwitchThread) and as a pthread cancellation
+ * cleanup handler (prvWaitForStart): a task deleted via vPortCancelThread is
+ * torn down with pthread_cancel(), which does not run the cooperative drain, so
+ * without this a thread cancelled while owning the lock would orphan the
+ * recursive mutex and wedge every later acquirer (e.g. the tick handler).
+ */
+static void prvRppDrainLock( void )
+{
+    while( xRppLockDepth > 0 )
+    {
+        xRppLockDepth--;
+        pthread_mutex_unlock( &xRppKernelLock );
+    }
+}
+
+static void prvRppDrainLockCleanup( void * pvUnused )
+{
+    ( void ) pvUnused;
+    prvRppDrainLock();
+}
+
+/*
+ * Returns non-zero if the current SIGALRM tick must be deferred because this
+ * thread is inside a guarded region - holding a non-async-signal-safe resource
+ * (the glibc malloc arena lock, or any std::mutex/pthread_mutex) that the tick
+ * handler's dispatch / context switch would re-enter or strand. Strongly defined
+ * by the integration-test tick guard (tick_guard.cpp), which re-raises SIGALRM
+ * once the last such resource is released. Weak default here so the port still
+ * links (and behaves as upstream) when the guard is not present.
+ */
+__attribute__( ( weak ) ) int rppTickGuardDeferTick( void )
+{
+    return 0;
+}
 /*-----------------------------------------------------------*/
 
 static void prvSetupSignalsAndSchedulerPolicy( void );
@@ -363,6 +449,7 @@ void vPortEnterCritical( void )
         vPortDisableInterrupts();
     }
 
+    prvRppLock();
     uxCriticalNesting++;
 }
 /*-----------------------------------------------------------*/
@@ -370,6 +457,8 @@ void vPortEnterCritical( void )
 void vPortExitCritical( void )
 {
     uxCriticalNesting--;
+
+    prvRppUnlock();
 
     /* If we have reached 0 then re-enable the interrupts. */
     if( uxCriticalNesting == 0 )
@@ -428,8 +517,23 @@ void vPortEnableInterrupts( void )
 
 UBaseType_t xPortSetInterruptMask( void )
 {
-    /* Interrupts are always disabled inside ISRs (signals
-     * handlers). */
+    /* Mask the tick (SIGALRM) for this interrupt-masked region *before* taking
+     * the kernel lock, then serialise fake-ISR code (xTaskNotifyFromISR from rpp
+     * worker threads) against the scheduler via the shared recursive lock.
+     *
+     * Masking first is essential: pthread_mutex_lock is not async-signal-safe,
+     * so if SIGALRM lands mid-acquisition (before ownership is recorded), the
+     * tick handler's own prvRppLock re-enters pthread_mutex_lock on the
+     * half-acquired recursive mutex and self-deadlocks. It also keeps the
+     * fake-ISR section atomic w.r.t. the tick (no context switch mid-section).
+     * Mirrors vPortEnterCritical, which disables interrupts before locking.
+     * Depth-tracked save/restore so nested masks behave. */
+    if( xIsrMaskDepth++ == 0 )
+    {
+        pthread_sigmask( SIG_BLOCK, &xAllSignals, &xIsrSavedSignalMask );
+    }
+
+    prvRppLock();
     return ( UBaseType_t ) 0;
 }
 /*-----------------------------------------------------------*/
@@ -437,6 +541,15 @@ UBaseType_t xPortSetInterruptMask( void )
 void vPortClearInterruptMask( UBaseType_t uxMask )
 {
     ( void ) uxMask;
+    /* Release the kernel lock while the tick is still masked (so the unlock is
+     * itself uninterruptible), then restore the prior signal mask at the
+     * outermost nesting level. */
+    prvRppUnlock();
+
+    if( --xIsrMaskDepth == 0 )
+    {
+        pthread_sigmask( SIG_SETMASK, &xIsrSavedSignalMask, NULL );
+    }
 }
 /*-----------------------------------------------------------*/
 
@@ -520,9 +633,9 @@ void prvSetupTimerInterrupt( void )
 
     /* Configure timer period */
     its.it_value.tv_sec = 0;
-    its.it_value.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL);
+    its.it_value.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL / TESTS_BOOST_FACTOR);
     its.it_interval.tv_sec = 0;
-    its.it_interval.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL);
+    its.it_interval.tv_nsec = (portTICK_RATE_MICROSECONDS * 1000UL / TESTS_BOOST_FACTOR);
 
     /* Start the timer */
     iRet = timer_settime( xPosixTimer, 0, &its, NULL );
@@ -544,6 +657,20 @@ static void vPortSystemTickHandler( int sig )
 
         ( void ) sig;
 
+        /* If this tick interrupted a guarded region on the current thread - i.e.
+         * the thread holds a non-async-signal-safe resource (the malloc arena
+         * lock, or an RPP/std::mutex) - running the tick now would deadlock:
+         * on_tick_hook re-enters the held lock, and the context switch would
+         * suspend the holder while another task blocks on it. So defer the whole
+         * tick; the guard re-raises SIGALRM the instant the last such resource is
+         * released. No tick is lost (re-raised) and no time drift
+         * (xTaskIncrementTick runs once, on the re-raised handler). */
+        if( rppTickGuardDeferTick() != 0 )
+        {
+            return;
+        }
+
+        prvRppLock();
         uxCriticalNesting++; /* Signals are blocked in this signal handler. */
 
         pxThreadToSuspend = prvGetThreadFromTask( xTaskGetCurrentTaskHandle() );
@@ -559,6 +686,7 @@ static void vPortSystemTickHandler( int sig )
         }
 
         uxCriticalNesting--;
+        prvRppUnlock();
     }
     else
     {
@@ -581,14 +709,26 @@ void vPortThreadDying( void * pxTaskToDelete,
 void vPortCancelThread( void * pxTaskToDelete )
 {
     Thread_t * pxThreadToCancel = prvGetThreadFromTask( pxTaskToDelete );
+    sigset_t xPrevMask;
 
     /*
-     * The thread has already been suspended so it can be safely cancelled.
+     * Block the tick (all signals) on the calling thread for the cancel + join.
+     * vPortCancelThread runs outside a critical section, so a SIGALRM landing
+     * here would run vPortSystemTickHandler -> prvRppLock(); if the thread being
+     * torn down still owns xRppKernelLock at the instant it is cancelled, that
+     * acquisition blocks forever and the whole process wedges at shutdown
+     * (observed as intermittent 300 s integration-test timeouts). The cancelled
+     * thread itself releases any lock it holds via the prvRppDrainLockCleanup
+     * cancellation handler installed in prvWaitForStart.
      */
+    ( void ) pthread_sigmask( SIG_BLOCK, &xAllSignals, &xPrevMask );
+
     pthread_cancel( pxThreadToCancel->pthread );
     event_signal( pxThreadToCancel->ev );
     pthread_join( pxThreadToCancel->pthread, NULL );
     event_delete( pxThreadToCancel->ev );
+
+    ( void ) pthread_sigmask( SIG_SETMASK, &xPrevMask, NULL );
 }
 /*-----------------------------------------------------------*/
 
@@ -597,6 +737,13 @@ static void * prvWaitForStart( void * pvParams )
     Thread_t * pxThread = pvParams;
 
     prvMarkAsFreeRTOSThread();
+
+    /* Release any xRppKernelLock levels this thread holds if it is torn down via
+     * pthread_cancel (vPortCancelThread). pthread_cancel does not run the
+     * cooperative dying drain in prvSwitchThread, so without this handler a task
+     * cancelled while owning the lock would orphan the recursive mutex. Runs on
+     * both pthread_cancel and pthread_exit unwinding. */
+    pthread_cleanup_push( prvRppDrainLockCleanup, NULL );
 
     prvSuspendSelf( pxThread );
 
@@ -616,6 +763,8 @@ static void * prvWaitForStart( void * pvParams )
      * to be triggered if configASSERT() is defined, so application writers can
      * catch the error. */
     configASSERT( pdFALSE );
+
+    pthread_cleanup_pop( 0 );
 
     return NULL;
 }
@@ -641,6 +790,7 @@ static void prvSwitchThread( Thread_t * pxThreadToResume,
 
         if( pxThreadToSuspend->xDying == pdTRUE )
         {
+            prvRppDrainLock();
             pthread_exit( NULL );
         }
 
@@ -666,7 +816,26 @@ static void prvSuspendSelf( Thread_t * thread )
      *
      * - A thread with all signals blocked with pthread_sigmask().
      */
-    event_wait( thread->ev );
+    {
+        int xResumeDepth = xRppLockDepth;
+        int xLevel;
+
+        /* Drop the kernel lock while blocked so the resumed thread / a pending
+         * fake-ISR can run, then reacquire to the same depth on wake. */
+        for( xLevel = 0; xLevel < xResumeDepth; xLevel++ )
+        {
+            pthread_mutex_unlock( &xRppKernelLock );
+        }
+        xRppLockDepth = 0;
+
+        event_wait( thread->ev );
+
+        for( xLevel = 0; xLevel < xResumeDepth; xLevel++ )
+        {
+            pthread_mutex_lock( &xRppKernelLock );
+        }
+        xRppLockDepth = xResumeDepth;
+    }
     pthread_testcancel();
 }
 
